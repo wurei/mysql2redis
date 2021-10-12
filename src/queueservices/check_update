@@ -1,0 +1,2 @@
+mysql -uroot -ppassword  myngle_production_www -e "update classes set created = created + 1 where \`status\` <= 25" &
+mysql -uroot -ppassword  myngle_production_www -e "update classes_users set created = created + 1 where \`status\` <= 25" &
