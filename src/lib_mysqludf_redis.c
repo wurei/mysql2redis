@@ -1,292 +1,340 @@
-/**
- * @file lib_mysqludf_redis.c
- * @brief The mysql udf for redis
- * Created by rei
- *
- * libmysq4redis - mysql udf for redis
- * Copyright (C) 2015 Xi'an Tomoon Tech Co.,Ltd. All rights are served.
- * web: http://www.tomoon.cn
- *
- * @author rei  mail: wurei@126.com
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <inttypes.h>
+#include <stdbool.h>
+
+#include <mysql.h>
+
+#include "thread_pool.h"
+#include <hiredis/hiredis.h>
+
+#define REDIS_HOST "127.0.0.1"
+#define REDIS_PORT 6379
+#define ushort     unsigned short
+#define uint       unsigned int
+#define TRUE       1
+#define FALSE      0
+
+/*
+mysql_config --plugindir
+
+CREATE FUNCTION `myngle_queue` RETURNS STRING SONAME 'libmysql4redis.so';
  */
 
-#include "lib_mysqludf_redis.h"
+typedef struct st_foreign_server {
+	bool parsed;
 
-struct _mysql4redis_t {
-    threadpool *thread_pool;
-    FILE *log_file;
-    void *user_data;
-};
+	char *connection_string;
+	char *scheme;
+	char *hostname;
+	char *username;
+	char *password;
+	char *database;
+	char *table_name;
+	ushort port;
 
-//static pthread_mutex_t redis_context_mutex = PTHREAD_MUTEX_INITIALIZER;
+	uint table_name_length, connect_string_length;
+} FOREIGN_SERVER;
 
-static mysql4redis_t *mysql4redis = NULL;
 
-void *
-_do_redis_command(thread *thread_p, void *data)
-{
-    redisContext *rc = thread_p->rc;
-    redisReply *reply = NULL;
-    struct redis_command *command = (struct redis_command *) data;
-
-    info_print("run redis command begin\n");
-    if (!rc || !command) {
-        info_print("_redis_context_init return null, connect failed\n");
-        goto failed;
-    }
-
-    reply = redisCommandArgv(rc, command->arg_count,
-            (const char **) command->argv, (const size_t *) command->argvlen);
-    info_print("run redis command normal\n");
-    if (!reply) {
-        info_print("_do_redis_command failed\n");
-        goto failed;
-    } else {
-        freeReplyObject(reply);
-    }
-    info_print("run redis command end\n");
-
-failed:
-    free_command(command);
-    command = NULL;
-
-    return NULL;
+static void
+freeServerShare(FOREIGN_SERVER *share) {
+	if (share != NULL) {
+		if (share->connection_string != NULL) {
+			free(share->connection_string);
+		}
+		free(share);
+	}
 }
 
-void free_command(struct redis_command *cmd)
-{
-    int i = 0;
 
-    if (cmd) {
-        debug_print("free command\n");
-        for (i = 0; i < cmd->arg_count; i++) {
-            if (cmd->argv[i])
-                free(cmd->argv[i]);
-        }
-        if (cmd->argv)
-            free(cmd->argv);
-        if (cmd->argvlen)
-            free(cmd->argvlen);
-        free(cmd);
-    }
+static int
+parse_url(FOREIGN_SERVER *share) {
+	share->port= 0;
+
+	/*
+	   No :// or @ in connection string. Must be a straight connection name of
+	   either "servername" or "servername/tablename"
+	*/
+	if ( (!strstr(share->connection_string, "://") &&
+	     (!strchr(share->connection_string, '@'))) ) {
+		goto error;
+	} else {
+		share->parsed= TRUE;
+		// Add a null for later termination of table name
+		share->connection_string[share->connect_string_length]= 0;
+		share->scheme= share->connection_string;
+
+		/*
+		   Remove addition of null terminator and store length
+		   for each string  in share
+		*/
+		if (!(share->username= (char *)strstr(share->scheme, "://")))
+			goto error;
+		share->scheme[share->username - share->scheme]= '\0';
+
+		if (strcmp(share->scheme, "redis"))
+			goto error;
+
+		share->username+= 3;
+
+		if (!(share->hostname= (char *)strchr(share->username, '@')))
+			goto error;
+		*share->hostname++= '\0';
+
+		if ((share->password= (char *)strchr(share->username, ':'))) {
+			*share->password++= '\0';
+
+			/* make sure there isn't an extra / or @ */
+			if ((strchr(share->password, '/') || strchr(share->hostname, '@')))
+				goto error;
+			/*
+			   Found that if the string is:
+			   user:@hostname:port/db/table
+			   Then password is a null string, so set to NULL
+			*/
+			if (share->password[0] == '\0')
+				share->password= NULL;
+		}
+
+		/* make sure there isn't an extra / or @ */
+		if ((strchr(share->username, '/')) || (strchr(share->hostname, '@')))
+			goto error;
+
+		if (!(share->database= (char *)strchr(share->hostname, '/')))
+			goto error;
+		*share->database++= '\0';
+
+		char* port = NULL;
+		if ((port= (char *)strchr(share->hostname, ':'))) {
+			*port++= '\0';
+			share->port= atoi(port);
+		}
+
+		if (!(share->table_name= (char *)strchr(share->database, '/')))
+			goto error;
+		*share->table_name++= '\0';
+
+		share->table_name_length= strlen(share->table_name);
+
+		/* make sure there's not an extra / */
+		if ((strchr(share->table_name, '/')))
+			goto error;
+
+		if (share->hostname[0] == '\0')
+			share->hostname= NULL;
+
+	}
+	if (!share->port) {
+		share->port= REDIS_PORT;
+	}
+	if (!share->hostname) {
+		share->hostname= REDIS_HOST;
+	}
+
+	return 0;
+
+error:
+	return -1;
 }
 
-void mysql4redis_destory()
-{
-    if (mysql4redis) {
-        if (mysql4redis->thread_pool) {
-            thpool_destroy(mysql4redis->thread_pool);
-            mysql4redis->thread_pool = NULL;
-        }
-        if (mysql4redis->log_file) {
-            fclose(mysql4redis->log_file);
-            mysql4redis->log_file = NULL;
-        }
-        free(mysql4redis);
-        mysql4redis = NULL;
-    }
+
+static cJSON*
+getJsonReply(redisReply *reply, cJSON *json) {
+	cJSON *array = NULL;
+	if (json == NULL) {
+		json = cJSON_CreateObject();
+	}
+
+	switch (reply->type) {
+	case REDIS_REPLY_STRING:
+		cJSON_AddStringToObject(json, "out", reply->str);
+		break;
+
+	case REDIS_REPLY_ARRAY:
+		array = cJSON_CreateArray();
+		cJSON_AddItemToObject(json, "out", array);
+		unsigned int i;
+		for (i = 0; i < reply->elements; i++) {
+			getJsonReply(reply->element[i], array);
+		}
+		break;
+
+	case REDIS_REPLY_INTEGER:
+		cJSON_AddNumberToObject(json, "out", reply->integer);
+		break;
+
+	case REDIS_REPLY_NIL:
+		cJSON_AddNullToObject(json, "out");
+		break;
+
+	case REDIS_REPLY_STATUS:
+		cJSON_AddStringToObject(json, "out", reply->str);
+		break;
+
+	case REDIS_REPLY_ERROR:
+		cJSON_AddStringToObject(json, "err", reply->str);
+		break;
+	}
+
+	return json;
 }
 
-mysql4redis_t *
-mysql4redis_new()
-{
-    if (mysql4redis) {
-        return mysql4redis;
-    }
-    mysql4redis = (mysql4redis_t *)malloc(sizeof(mysql4redis_t));
-    if (mysql4redis == NULL) {
-        printf("init mysql4redis failed!\n");
-        return NULL;
-    }
-    mysql4redis->log_file = NULL;
-    if (cfg.debug) {
-        mysql4redis->log_file = fopen(cfg.log_file, "a+");
-    }
-    mysql4redis->thread_pool = (threadpool *) thpool_init(cfg.worker);
-    if (mysql4redis->thread_pool == NULL) {
-        mysql4redis_destory(mysql4redis);
-        return NULL;
-    }
-    return mysql4redis;
+
+static char*
+getResultFromRedisReply(redisReply *reply) {
+	char *result;
+	cJSON *jsonReply = getJsonReply(reply, NULL);
+	{
+		result = cJSON_Print(jsonReply);
+	}
+	cJSON_Delete(jsonReply);
+	return result;
 }
 
-redisContext *
-redis_context_new()
-{
-    redisContext *rc = NULL;
-    redisReply *reply;
-    char cmd[256] = { 0 };
-    int len = 0;
-
-    info_print("Connection redis\n");
-    if (cfg.type == CONN_TCP) {
-        rc = redisConnect(cfg.tcp.host, cfg.tcp.port);
-    } else if (cfg.type == CONN_UNIX_SOCK) {
-        rc = redisConnectUnix(cfg.unix_sock.path);
-    }
-
-    if (rc->err && mysql4redis->log_file) {
-        info_print("Connection error: %s\n", rc->errstr);
-        return rc;
-    }
-
-    if (cfg.auth) {
-        info_print("Connection redis\n");
-        reply = redisCommand(rc, "AUTH %s", cfg.password);
-        if (reply) {
-            freeReplyObject(reply);
-            reply = NULL;
-        }
-    }
-
-    if (rc)
-        info_print("Connection success\n");
-
-    return rc;
+static char*
+getErrorResult(char *message) {
+	char *result;
+	cJSON *json = cJSON_CreateObject();
+	cJSON_AddStringToObject(json, "err", message);
+	{
+		result = cJSON_Print(json);
+	}
+	cJSON_Delete(json);
+	return result;
 }
 
-void redis_context_destory(redisContext *rc)
+
+/**********************************
+  redis
+
+  redis(server, command, args...);
+
+  RETURN json
+*/
+
+bool
+myngle_queue_init(UDF_INIT *initid,
+           UDF_ARGS *args,
+           char     *message)
 {
-    if (rc) {
-        redisFree(rc);
-        rc = NULL;
-    }
+	if (args->arg_count < 2) {
+		strcpy(message, "requires at last two arguments.");
+		return EXIT_FAILURE;
+	}
+	if (args->args[0] == NULL || args->args[1] == NULL) {
+		initid->ptr = NULL;
+	} else {
+		if (args->arg_type[0] != STRING_RESULT ||
+		    args->arg_type[1] != STRING_RESULT) {
+			strcpy(message, "invalid arguments.");
+			return EXIT_FAILURE;
+		}
+	}
+
+	initid->maybe_null = 1;
+	return EXIT_SUCCESS;
 }
 
-my_bool redis_servers_init(UDF_INIT *initid __attribute__((__unused__)),
-        UDF_ARGS *args, char *message)
+
+void
+myngle_queue_deinit(UDF_INIT *initid)
 {
-    //pthread_mutex_lock(&redis_context_mutex);
-
-    if (args->arg_count < 2 || args->arg_type[0] != STRING_RESULT
-            || args->arg_type[1] != INT_RESULT) {
-        strncpy(message, "Usage:host port", MYSQL_ERRMSG_SIZE);
-        goto failed;
-    }
-
-    if (args->arg_count == 3 && args->arg_type[2] != STRING_RESULT) {
-        strncpy(message, "Usage:host port password", MYSQL_ERRMSG_SIZE);
-        goto failed;
-    }
-
-    strncpy(cfg.tcp.host, (char *) args->args[0], sizeof(cfg.tcp.host));
-    cfg.tcp.port = *((longlong *) args->args[1]);
-    if (args->arg_count == 3) {
-        cfg.auth = 1;
-        strncpy(cfg.password, (char *) args->args[2], sizeof(cfg.password));
-    }
-
-    if (mysql4redis_new() == NULL) {
-        strncpy(message, "init failed", MYSQL_ERRMSG_SIZE);
-        goto failed;
-    }
-
-    debug_print("init redis success\n");
-
-    //pthread_mutex_unlock(&redis_context_mutex);
-    return 0;
-
-failed:
-    //pthread_mutex_unlock(&redis_context_mutex);
-    return -1;
+	if (initid->ptr != NULL) {
+		free(initid->ptr);
+	}
 }
 
-void redis_servers_deinit(UDF_INIT *initid __attribute__((unused)))
+
+char*
+myngle_queue(UDF_INIT      *initid,
+      UDF_ARGS      *args,
+      char          *result,
+      unsigned long *length,
+      char          *is_null,
+      char          *error)
 {
-    debug_print("redis deinit");
-}
+	// check arguments
+	if (args->args[0] == NULL || args->args[1] == NULL) {
+		*is_null = 1;
+		return NULL;
+	} else {
+		if (args->arg_type[0] != STRING_RESULT ||
+		    args->arg_type[1] != STRING_RESULT) {
+			// invalid arguments
+			*error   = 1;
+			return NULL;
+		}
+	}
 
-my_ulonglong redis_servers(UDF_INIT *initid __attribute__((__unused__)),
-        UDF_ARGS *args, char *is_null __attribute__((__unused__)),
-        char *error __attribute__((__unused__)))
-{
-    return 0;
-}
+	FOREIGN_SERVER *server = NULL;
+	redisContext   *ctx    = NULL;
+	redisReply     *reply  = NULL;
 
-my_bool redis_command_init(UDF_INIT *initid __attribute__((__unused__)),
-        UDF_ARGS *args, char *message)
-{
-    if (args->arg_count >= 3 && args->arg_type[0] == STRING_RESULT
-            && args->arg_type[1] == STRING_RESULT
-            && args->arg_type[2] == STRING_RESULT) {
-        args->maybe_null = NULL;
-        if (!mysql4redis) {
-            snprintf(message, MYSQL_ERRMSG_SIZE, "redis not init");
-            return 1;
-        }
-        return 0;
-    } else {
-        snprintf(message, MYSQL_ERRMSG_SIZE,
-                "redis_command(cmd,arg1,arg2,[...])");
-    }
-    return 1;
-}
+	server = malloc(sizeof(FOREIGN_SERVER));
+	if (server == NULL) {
+		// out of memory
+		*error = 1;
+		goto final;
+	}
 
-void redis_command_deinit(UDF_INIT *initid __attribute__((__unused__)))
-{
-    debug_print("redis_command_deinit\n");
-}
+	// import argument server
+	server->connection_string = strdup(args->args[0]);
+	server->connect_string_length = (unsigned short)args->lengths[0];
 
-my_ulonglong redis_command(UDF_INIT *initid __attribute__((__unused__)),
-        UDF_ARGS *args, char *is_null __attribute__((__unused__)),
-        char *error __attribute__((__unused__)))
-{
-    int i = 0, res = 0, r = 0;
-    struct redis_command *command = malloc(sizeof(struct redis_command));
-    if (command == NULL) {
-        return r;
-    }
-    command->argv = malloc(args->arg_count * sizeof(void *));
-    if (command->argv == NULL) {
-        free(command);
-        return r;
-    }
-    command->argvlen = malloc(args->arg_count * sizeof(size_t));
-    if (command->argvlen == NULL) {
-        free(command->argv);
-        return r;
-    }
-    command->arg_count = args->arg_count;
 
-    debug_print("number of args %d\n", args->arg_count);
+	if (parse_url(server) != 0) {
+		result = getErrorResult("invalid connection string");
+		goto final;
+	}
 
-    for (i = 0; i < args->arg_count; i++) {
-        command->argv[i] = malloc(args->lengths[i]);
-        if (command->argv[i] == NULL) {
-            free_command(command);
-        }
-        memcpy(command->argv[i], args->args[i], args->lengths[i]);
-        command->argvlen[i] = args->lengths[i];
-    }
+	// connection to redis
+	ctx = redisConnect(server->hostname, server->port);
+	if (ctx != NULL && ctx->err) {
+		result = getErrorResult(ctx->errstr);
+		goto final;
+	}
+	// send AUTH command to redis
+	if (server->password != NULL) {
+		reply = redisCommand(ctx, "AUTH %s", server->password);
+		if (reply != NULL) {
+			if (reply->type == REDIS_REPLY_ERROR) {
+				result = getResultFromRedisReply(reply);
+				goto final;
+			}
+			freeReplyObject(reply);
+		}
+	}
+	// send SELECT dbnum to redis
+	if (server->database != 0) {
+		reply = redisCommand(ctx, "SELECT %s", server->database);
+		if (reply != NULL) {
+			if (reply->type == REDIS_REPLY_ERROR) {
+				result = getResultFromRedisReply(reply);
+				goto final;
+			}
+			freeReplyObject(reply);
+		}
+	}
 
-    if (mysql4redis->thread_pool) {
-        res = thpool_add_work(mysql4redis->thread_pool, _do_redis_command,
-                command);
-        if (res == -1) {
-            free_command(command);
-            command = NULL;
-        }
-        info_print("queue size=%d\n", thpool_get_queue_size(mysql4redis->thread_pool));
-    }
+	int  argc   = args->arg_count - 1;
+	char **argv = ++args->args;
+	size_t *argvlen = ++args->lengths;
+	reply = redisCommandArgv(ctx, argc, (const char**)argv, (const size_t*)argvlen);
+	result = getResultFromRedisReply(reply);
 
-    return r;
-}
+final:
+	if (reply  != NULL) freeReplyObject(reply);
+	if (ctx    != NULL) redisFree(ctx);
+	if (server != NULL) freeServerShare(server);
 
-my_bool redis_destory_init(UDF_INIT *initid __attribute__((__unused__)),
-        UDF_ARGS *args, char *message)
-{
-    return 0;
-}
-
-void redis_destory_deinit(UDF_INIT *initid __attribute__((unused)))
-{
-    debug_print("redis_command_deinit\n");
-}
-
-my_ulonglong redis_destory(UDF_INIT *initid __attribute__((__unused__)),
-        UDF_ARGS *args, char *is_null __attribute__((__unused__)),
-        char *error __attribute__((__unused__)))
-{
-    mysql4redis_destory();
-    return 0;
+	if (result != NULL) {
+		*length = strlen(result);
+		initid->max_length = *length;
+		initid->ptr = result;
+	} else {
+		*is_null = 1;
+	}
+	return result;
 }

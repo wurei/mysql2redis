@@ -1,0 +1,1 @@
+watch -n 1 "top -bn1 | head -n 5 && echo '' && echo '' && tail /var/log/queueservices.log && echo '' && echo '' && redis-cli llen myngle_queue_classes_after_change && echo '' && redis-cli lrange myngle_queue_classes_after_change 0 0"
