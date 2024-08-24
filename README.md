@@ -9,6 +9,7 @@ I found this [mysql2redis](https://github.com/wurei/mysql4redis.git/) which alre
 hiredis:https://github.com/redis/hiredis
 
 In Debian, maybe you have to install below library:
+
 apt-get install -y intltool libtool m4 automake build-essential libmysqlclient-dev libssl-dev
 
 
